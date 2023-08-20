@@ -42,6 +42,8 @@ use tokio::process;
 use std::os::unix::io::FromRawFd;
 
 #[cfg(windows)]
+use std::io::IsTerminal;
+#[cfg(windows)]
 use std::os::windows::io::FromRawHandle;
 #[cfg(windows)]
 use winapi::um::processenv::GetStdHandle;
@@ -384,6 +386,27 @@ impl StdFileResourceInner {
   }
 }
 
+#[cfg(windows)]
+fn if_needed_check_utf8<T: Write + IsTerminal>(
+  file: &T,
+  buf: &[u8],
+) -> FsResult<()> {
+  if !file.is_terminal() {
+    return Ok(());
+  }
+  match std::str::from_utf8(buf) {
+    Err(err) => Err(FsError::Io(io::Error::new(
+      io::ErrorKind::InvalidData,
+      format!("Windows stdio in console mode does not support writing non-UTF-8 byte sequences ({})", err)
+    ))),
+    _ => Ok(()),
+  }
+}
+#[cfg(not(windows))]
+const fn if_needed_check_utf8<T>(file: &T, buf: &[u8]) -> FsResult<()> {
+  Ok(())
+}
+
 #[async_trait::async_trait(?Send)]
 impl crate::fs::File for StdFileResourceInner {
   fn write_sync(self: Rc<Self>, buf: &[u8]) -> FsResult<usize> {
@@ -401,6 +424,7 @@ impl crate::fs::File for StdFileResourceInner {
       StdFileResourceKind::Stdout => {
         // bypass the file and use std::io::stdout()
         let mut stdout = std::io::stdout().lock();
+        if_needed_check_utf8(&stdout, buf)?;
         let nwritten = stdout.write(buf)?;
         stdout.flush()?;
         Ok(nwritten)
@@ -437,6 +461,7 @@ impl crate::fs::File for StdFileResourceInner {
       StdFileResourceKind::Stdout => {
         // bypass the file and use std::io::stdout()
         let mut stdout = std::io::stdout().lock();
+        if_needed_check_utf8(&stdout, buf)?;
         stdout.write_all(buf)?;
         stdout.flush()?;
         Ok(())
@@ -465,6 +490,7 @@ impl crate::fs::File for StdFileResourceInner {
           .with_blocking_task(move || {
             // bypass the file and use std::io::stdout()
             let mut stdout = std::io::stdout().lock();
+            if_needed_check_utf8(&stdout, &buf)?;
             stdout.write_all(&buf)?;
             stdout.flush()?;
             Ok(())
@@ -506,6 +532,7 @@ impl crate::fs::File for StdFileResourceInner {
           .with_blocking_task(|| {
             // bypass the file and use std::io::stdout()
             let mut stdout = std::io::stdout().lock();
+            if_needed_check_utf8(&stdout, &view)?;
             let nwritten = stdout.write(&view)?;
             stdout.flush()?;
             Ok(deno_core::WriteOutcome::Partial { nwritten, view })
