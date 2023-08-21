@@ -116,7 +116,13 @@ deno_core::extension!(deno_io,
       let rid = t.add(FileResource::new(
         Rc::new(match stdio.stdout {
           StdioPipe::Inherit => StdFileResourceInner::new(
-            StdFileResourceKind::Stdout,
+            {
+              #[cfg(not(windows))]
+              let supports_non_utf8 = true;
+              #[cfg(windows)]
+              let supports_non_utf8 = !std::io::stdout().is_terminal();
+              StdFileResourceKind::Stdout { supports_non_utf8 }
+            },
             STDOUT_HANDLE.try_clone().unwrap(),
           ),
           StdioPipe::File(pipe) => StdFileResourceInner::file(pipe),
@@ -299,7 +305,7 @@ enum StdFileResourceKind {
   // std's wrappers. So we take a bit of a complexity hit in order to not
   // have to duplicate the functionality in Rust's std/src/sys/windows/stdio.rs
   Stdin,
-  Stdout,
+  Stdout { supports_non_utf8: bool },
   Stderr,
 }
 
@@ -387,11 +393,8 @@ impl StdFileResourceInner {
 }
 
 #[cfg(windows)]
-fn if_needed_check_utf8<T: Write + IsTerminal>(
-  file: &T,
-  buf: &[u8],
-) -> FsResult<()> {
-  if !file.is_terminal() {
+fn if_needed_check_utf8(supports_non_utf8: bool, buf: &[u8]) -> FsResult<()> {
+  if supports_non_utf8 {
     return Ok(());
   }
   match std::str::from_utf8(buf) {
@@ -403,7 +406,10 @@ fn if_needed_check_utf8<T: Write + IsTerminal>(
   }
 }
 #[cfg(not(windows))]
-const fn if_needed_check_utf8<T>(file: &T, buf: &[u8]) -> FsResult<()> {
+const fn if_needed_check_utf8(
+  _supports_non_utf8: bool,
+  _buf: &[u8],
+) -> FsResult<()> {
   Ok(())
 }
 
@@ -421,10 +427,10 @@ impl crate::fs::File for StdFileResourceInner {
       StdFileResourceKind::Stdin => {
         Err(Into::<std::io::Error>::into(ErrorKind::Unsupported).into())
       }
-      StdFileResourceKind::Stdout => {
+      StdFileResourceKind::Stdout { supports_non_utf8 } => {
         // bypass the file and use std::io::stdout()
         let mut stdout = std::io::stdout().lock();
-        if_needed_check_utf8(&stdout, buf)?;
+        if_needed_check_utf8(supports_non_utf8, buf)?;
         let nwritten = stdout.write(buf)?;
         stdout.flush()?;
         Ok(nwritten)
@@ -444,7 +450,7 @@ impl crate::fs::File for StdFileResourceInner {
       StdFileResourceKind::File | StdFileResourceKind::Stdin => {
         self.with_sync(|file| Ok(file.read(buf)?))
       }
-      StdFileResourceKind::Stdout | StdFileResourceKind::Stderr => {
+      StdFileResourceKind::Stdout { .. } | StdFileResourceKind::Stderr => {
         Err(FsError::NotSupported)
       }
     }
@@ -458,10 +464,10 @@ impl crate::fs::File for StdFileResourceInner {
       StdFileResourceKind::Stdin => {
         Err(Into::<std::io::Error>::into(ErrorKind::Unsupported).into())
       }
-      StdFileResourceKind::Stdout => {
+      StdFileResourceKind::Stdout { supports_non_utf8 } => {
         // bypass the file and use std::io::stdout()
         let mut stdout = std::io::stdout().lock();
-        if_needed_check_utf8(&stdout, buf)?;
+        if_needed_check_utf8(supports_non_utf8, buf)?;
         stdout.write_all(buf)?;
         stdout.flush()?;
         Ok(())
@@ -485,12 +491,12 @@ impl crate::fs::File for StdFileResourceInner {
       StdFileResourceKind::Stdin => {
         Err(Into::<std::io::Error>::into(ErrorKind::Unsupported).into())
       }
-      StdFileResourceKind::Stdout => {
+      StdFileResourceKind::Stdout { supports_non_utf8 } => {
         self
           .with_blocking_task(move || {
             // bypass the file and use std::io::stdout()
             let mut stdout = std::io::stdout().lock();
-            if_needed_check_utf8(&stdout, &buf)?;
+            if_needed_check_utf8(supports_non_utf8, &buf)?;
             stdout.write_all(&buf)?;
             stdout.flush()?;
             Ok(())
@@ -527,12 +533,12 @@ impl crate::fs::File for StdFileResourceInner {
       StdFileResourceKind::Stdin => {
         Err(Into::<std::io::Error>::into(ErrorKind::Unsupported).into())
       }
-      StdFileResourceKind::Stdout => {
+      StdFileResourceKind::Stdout { supports_non_utf8 } => {
         self
-          .with_blocking_task(|| {
+          .with_blocking_task(move || {
             // bypass the file and use std::io::stdout()
             let mut stdout = std::io::stdout().lock();
-            if_needed_check_utf8(&stdout, &view)?;
+            if_needed_check_utf8(supports_non_utf8, &view)?;
             let nwritten = stdout.write(&view)?;
             stdout.flush()?;
             Ok(deno_core::WriteOutcome::Partial { nwritten, view })
@@ -560,7 +566,7 @@ impl crate::fs::File for StdFileResourceInner {
         self.with_sync(|file| Ok(file.read_to_end(&mut buf)?))?;
         Ok(buf)
       }
-      StdFileResourceKind::Stdout | StdFileResourceKind::Stderr => {
+      StdFileResourceKind::Stdout { .. } | StdFileResourceKind::Stderr => {
         Err(FsError::NotSupported)
       }
     }
@@ -576,7 +582,7 @@ impl crate::fs::File for StdFileResourceInner {
           })
           .await
       }
-      StdFileResourceKind::Stdout | StdFileResourceKind::Stderr => {
+      StdFileResourceKind::Stdout { .. } | StdFileResourceKind::Stderr => {
         Err(FsError::NotSupported)
       }
     }
